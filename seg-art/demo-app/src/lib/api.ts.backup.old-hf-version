@@ -1,0 +1,1253 @@
+// API Configuration
+const HF_API_URL = 'https://api-inference.huggingface.co/models';
+const HF_API_KEY = import.meta.env.VITE_HUGGING_FACE_API_KEY;
+const PHOTOROOM_API_URL = 'https://sdk.photoroom.com/v1/segment';
+const PHOTOROOM_API_KEY = import.meta.env.VITE_PHOTOROOM_API_KEY;
+const OPENAI_API_KEY = import.meta.env.VITE_OPENAI_API_KEY;
+
+// Model Endpoints - Only models actually used in Extract Art feature
+const MODEL_ENDPOINTS = {
+  'object-detection': 'facebook/detr-resnet-50',
+  'face-parsing': 'jonathandinu/face-parsing'
+} as const;
+
+// Enhanced rate limiting for dedicated endpoint (much more generous)
+const API_CONFIG = {
+  maxRetries: 3,
+  retryDelay: 1000, // 1 second between retries
+  maxRequestsPerMinute: 20, // More generous for dedicated endpoint
+  requests: [] as number[],
+  requestWindow: 60000, // 1 minute window
+  timeout: 300000, // 5 minutes timeout for image generation
+};
+
+// Helper functions
+function canMakeRequest(): boolean {
+  const now = Date.now();
+  API_CONFIG.requests = API_CONFIG.requests.filter(
+    time => now - time < API_CONFIG.requestWindow
+  );
+  return API_CONFIG.requests.length < API_CONFIG.maxRequestsPerMinute;
+}
+
+function addRequest(): void {
+  API_CONFIG.requests.push(Date.now());
+}
+
+async function waitForRateLimit(): Promise<void> {
+  while (!canMakeRequest()) {
+    console.log('Rate limit reached, waiting 5 seconds...');
+    await new Promise(resolve => setTimeout(resolve, 5000));
+  }
+}
+
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// API key validation
+function validateApiKeys(): { hf: boolean; photoroom: boolean; openai: boolean } {
+  const hfValid = HF_API_KEY &&
+    HF_API_KEY.startsWith('hf_') &&
+    HF_API_KEY.length > 30 &&
+    !HF_API_KEY.includes('your_huggingface_api_key_here') &&
+    !HF_API_KEY.includes('your_key_here');
+
+  const photoroomValid = PHOTOROOM_API_KEY &&
+    PHOTOROOM_API_KEY.length > 10 &&
+    !PHOTOROOM_API_KEY.includes('your_key_here');
+
+  const openaiValid = OPENAI_API_KEY &&
+    OPENAI_API_KEY.startsWith('sk-') &&
+    OPENAI_API_KEY.length > 10 &&
+    !OPENAI_API_KEY.includes('your_key_here');
+
+  console.log('API Key Validation:', {
+    hf: hfValid ? 'Valid' : 'Invalid/Missing',
+    hfKey: HF_API_KEY ? `${HF_API_KEY.substring(0, 8)}...` : 'Not found',
+    photoroom: photoroomValid ? 'Valid' : 'Invalid/Missing',
+    openai: openaiValid ? 'Valid' : 'Invalid/Missing'
+  });
+
+  return {
+    hf: hfValid,
+    photoroom: photoroomValid,
+    openai: openaiValid
+  };
+}
+
+// Object detection function
+export async function detectObjects(imageBlob: Blob): Promise<Array<{ label: string; box: { xmin: number; ymin: number; xmax: number; ymax: number } }>> {
+  const apiKeys = validateApiKeys();
+  
+  if (!apiKeys.hf) {
+    throw new Error('Hugging Face API key is not configured or invalid. Please ensure it starts with "hf_" and has inference permissions.');
+  }
+
+  let retries = API_CONFIG.maxRetries;
+  let lastError: Error | null = null;
+
+  while (retries > 0) {
+    try {
+      await waitForRateLimit();
+      addRequest();
+
+      const response = await fetch(`${HF_API_URL}/${MODEL_ENDPOINTS['object-detection']}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${HF_API_KEY}`,
+          'Content-Type': 'application/octet-stream'
+        },
+        body: imageBlob
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        let errorMessage = 'Failed to detect objects';
+        
+        try {
+          const errorData = JSON.parse(error);
+          if (errorData.error) {
+            if (errorData.error.includes('loading')) {
+              throw new Error('Model is currently loading, please wait a moment and try again');
+            }
+            if (errorData.error.includes('rate limit') || errorData.error.includes('Rate limit')) {
+              throw new Error('Rate limit exceeded, please wait before trying again');
+            }
+            if (errorData.error.includes('unauthorized') || errorData.error.includes('Invalid token') || errorData.error.includes('Invalid credentials')) {
+              throw new Error('Invalid Hugging Face API token. Please check your token configuration and ensure it has inference permissions.');
+            }
+            errorMessage = errorData.error;
+          }
+        } catch (parseError) {
+          if (response.status === 503) {
+            throw new Error('Model is currently loading, please wait a moment and try again');
+          }
+          if (response.status === 429) {
+            throw new Error('Rate limit exceeded, please wait before trying again');
+          }
+          if (response.status === 401 || response.status === 403) {
+            throw new Error('Invalid Hugging Face API token. Please check your token configuration and ensure it has inference permissions.');
+          }
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      const detections = await response.json();
+      
+      if (!Array.isArray(detections)) {
+        throw new Error('Invalid response format from object detection API');
+      }
+      
+      return detections.map(detection => ({
+        label: detection.label || 'unknown',
+        box: {
+          xmin: detection.box?.xmin || 0,
+          ymin: detection.box?.ymin || 0,
+          xmax: detection.box?.xmax || 1,
+          ymax: detection.box?.ymax || 1
+        }
+      }));
+    } catch (error) {
+      console.error('Object detection attempt failed:', error);
+      lastError = error instanceof Error ? error : new Error('An unexpected error occurred');
+      
+      if (error instanceof Error && error.message.includes('loading') && retries > 1) {
+        console.log(`Model loading, waiting ${API_CONFIG.retryDelay}ms before retry...`);
+        await delay(API_CONFIG.retryDelay);
+        retries--;
+        continue;
+      } else if (error instanceof Error && error.message.includes('Rate limit') && retries > 1) {
+        console.log(`Rate limited, waiting ${API_CONFIG.retryDelay}ms before retry...`);
+        await delay(API_CONFIG.retryDelay);
+        retries--;
+        continue;
+      }
+      
+      if (retries <= 1) {
+        throw lastError;
+      }
+      
+      retries--;
+      await delay(API_CONFIG.retryDelay);
+    }
+  }
+
+  throw lastError || new Error('Failed to detect objects after multiple retries');
+}
+
+// Face parsing using pixel-perfect segmentation masks
+export async function segmentImage(imageBlob: Blob): Promise<{ masks: Array<{ label: string; mask: string; bounds: { xmin: number; ymin: number; xmax: number; ymax: number } }> }> {
+  const apiKeys = validateApiKeys();
+
+  if (!apiKeys.hf) {
+    throw new Error('Hugging Face API key is not configured or invalid');
+  }
+
+  let retries = API_CONFIG.maxRetries;
+  let lastError: Error | null = null;
+
+  while (retries > 0) {
+    try {
+      await waitForRateLimit();
+      addRequest();
+
+      console.log('Calling face parsing API...');
+
+      // Use face parsing model to get pixel-perfect masks
+      const response = await fetch(`${HF_API_URL}/${MODEL_ENDPOINTS['face-parsing']}`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${HF_API_KEY}`,
+          'Content-Type': 'application/octet-stream'
+        },
+        body: imageBlob
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        let errorMessage = 'Failed to parse face';
+
+        try {
+          const errorData = JSON.parse(error);
+          if (errorData.error) {
+            if (errorData.error.includes('loading')) {
+              throw new Error('Model is currently loading, please wait a moment and try again');
+            }
+            if (errorData.error.includes('rate limit')) {
+              throw new Error('Rate limit exceeded, please wait before trying again');
+            }
+            errorMessage = errorData.error;
+          }
+        } catch (parseError) {
+          if (response.status === 503) {
+            throw new Error('Model is currently loading, please wait a moment and try again');
+          }
+          if (response.status === 429) {
+            throw new Error('Rate limit exceeded, please wait before trying again');
+          }
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      const result = await response.json();
+
+      console.log('Face parsing response:', result);
+
+      if (!Array.isArray(result)) {
+        throw new Error('Invalid response format from face parsing API');
+      }
+
+      // Process the results - each item has label, score, and mask (base64 PNG)
+      const masks = await Promise.all(result.map(async (item: any) => {
+        const { label, mask } = item;
+
+        if (!mask) {
+          console.warn(`No mask for ${label}`);
+          return null;
+        }
+
+        // mask is base64 encoded PNG - convert to data URL for bounds calculation
+        const maskDataUrl = `data:image/png;base64,${mask}`;
+
+        // Calculate bounds from mask image
+        const bounds = await calculateBoundsFromMaskImage(maskDataUrl);
+
+        return {
+          label: label || 'unknown',
+          mask: mask, // Return just the base64 string (no data URL prefix)
+          bounds
+        };
+      }));
+
+      // Filter out null entries
+      const validMasks = masks.filter(m => m !== null) as Array<{ label: string; mask: string; bounds: { xmin: number; ymin: number; xmax: number; ymax: number } }>;
+
+      console.log(`Successfully parsed ${validMasks.length} face regions`);
+
+      return { masks: validMasks };
+    } catch (error) {
+      console.error('Face parsing attempt failed:', error);
+      lastError = error instanceof Error ? error : new Error('Face parsing failed');
+
+      if (error instanceof Error && error.message.includes('loading') && retries > 1) {
+        console.log(`Model loading, waiting ${API_CONFIG.retryDelay * 2}ms before retry...`);
+        await delay(API_CONFIG.retryDelay * 2);
+        retries--;
+        continue;
+      }
+
+      if (retries > 1) {
+        await delay(API_CONFIG.retryDelay);
+        retries--;
+        continue;
+      }
+
+      throw lastError;
+    }
+  }
+
+  throw lastError || new Error('Failed to segment image');
+}
+
+// Helper function to calculate bounding box from mask image
+async function calculateBoundsFromMaskImage(maskDataUrl: string): Promise<{ xmin: number; ymin: number; xmax: number; ymax: number }> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement('canvas');
+      canvas.width = img.width;
+      canvas.height = img.height;
+      const ctx = canvas.getContext('2d');
+
+      if (!ctx) {
+        resolve({ xmin: 0, ymin: 0, xmax: 1, ymax: 1 });
+        return;
+      }
+
+      ctx.drawImage(img, 0, 0);
+      const imageData = ctx.getImageData(0, 0, img.width, img.height);
+      const pixels = imageData.data;
+
+      let xmin = img.width, ymin = img.height, xmax = 0, ymax = 0;
+      let hasPixels = false;
+
+      // Find bounding box of non-transparent pixels
+      for (let y = 0; y < img.height; y++) {
+        for (let x = 0; x < img.width; x++) {
+          const i = (y * img.width + x) * 4;
+          const alpha = pixels[i + 3];
+
+          if (alpha > 0) {
+            hasPixels = true;
+            xmin = Math.min(xmin, x);
+            xmax = Math.max(xmax, x);
+            ymin = Math.min(ymin, y);
+            ymax = Math.max(ymax, y);
+          }
+        }
+      }
+
+      if (!hasPixels) {
+        resolve({ xmin: 0, ymin: 0, xmax: 1, ymax: 1 });
+        return;
+      }
+
+      // Normalize to 0-1 range
+      resolve({
+        xmin: xmin / img.width,
+        ymin: ymin / img.height,
+        xmax: xmax / img.width,
+        ymax: ymax / img.height
+      });
+    };
+
+    img.onerror = () => {
+      resolve({ xmin: 0, ymin: 0, xmax: 1, ymax: 1 });
+    };
+
+    img.src = maskDataUrl;
+  });
+}
+
+// Helper function for HF Dedicated Endpoint inpainting
+async function contentAwareFillWithHF(params: {
+  image: Blob;
+  mask: Blob;
+  prompt?: string;
+}): Promise<string> {
+  console.log('Using HF Dedicated Endpoint for inpainting...');
+
+  // Convert blobs to base64
+  const imageBase64 = await blobToBase64(params.image);
+  const maskBase64 = await blobToBase64(params.mask);
+
+  const requestBody = {
+    inputs: params.prompt || 'photorealistic, seamless, natural, high quality',
+    image: imageBase64.split(',')[1], // Remove data URL prefix
+    mask_image: maskBase64.split(',')[1], // Remove data URL prefix
+    parameters: {
+      negative_prompt: 'blurry, low quality, distorted, artifacts, seams',
+      num_inference_steps: 50,
+      guidance_scale: 7.5
+    }
+  };
+
+  console.log('Sending request to HF Dedicated Endpoint...');
+
+  const response = await fetch(HF_DEDICATED_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${HF_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'image/png'
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('HF Dedicated Endpoint error:', errorText);
+    throw new Error(`HF Dedicated Endpoint failed: ${response.status} - ${errorText}`);
+  }
+
+  // Check if response is an image
+  const contentType = response.headers.get('content-type');
+  if (!contentType || !contentType.startsWith('image/')) {
+    const responseText = await response.text();
+    console.error('Unexpected response:', responseText);
+    throw new Error('Expected image response from HF Dedicated Endpoint');
+  }
+
+  const blob = await response.blob();
+  console.log('HF Dedicated Endpoint inpainting successful!');
+  return URL.createObjectURL(blob);
+}
+
+// Helper function for HF Inference API inpainting
+async function contentAwareFillWithInferenceAPI(params: {
+  image: Blob;
+  mask: Blob;
+  prompt?: string;
+}): Promise<string> {
+  console.log('Starting content-aware fill...');
+
+  await waitForRateLimit();
+  addRequest();
+
+  // Convert blobs to base64
+  const imageBase64 = await blobToBase64(params.image);
+  const maskBase64 = await blobToBase64(params.mask);
+
+  const requestBody = {
+    inputs: {
+      prompt: params.prompt || 'photorealistic, seamless, natural, high quality',
+      image: imageBase64.split(',')[1], // Remove data URL prefix
+      mask_image: maskBase64.split(',')[1] // Remove data URL prefix
+    },
+    parameters: {
+      negative_prompt: 'blurry, low quality, distorted, artifacts, seams',
+      num_inference_steps: 50,
+      guidance_scale: 7.5
+    }
+  };
+
+  console.log('Sending request to HF Inference API inpainting model...');
+
+  const endpoint = `${HF_API_URL}/${MODEL_ENDPOINTS['inpainting']}`;
+  console.log('Inpainting endpoint:', endpoint);
+
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${HF_API_KEY}`,
+      'Content-Type': 'application/json',
+      'Accept': 'image/png'
+    },
+    body: JSON.stringify(requestBody)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('Inpainting API error:', errorText);
+    throw new Error(`Content-aware fill failed: ${errorText || response.statusText}`);
+  }
+
+  // Check if response is an image
+  const contentType = response.headers.get('content-type');
+  if (!contentType || !contentType.startsWith('image/')) {
+    const responseText = await response.text();
+    console.error('Unexpected response:', responseText);
+    throw new Error('Expected image response from inpainting API');
+  }
+
+  const blob = await response.blob();
+  console.log('Content-aware fill successful!');
+  return URL.createObjectURL(blob);
+}
+
+// Content-aware fill using HF Inference API or Replicate fallback
+export async function contentAwareFill(params: {
+  image: Blob;
+  mask: Blob;
+  prompt?: string;
+}): Promise<string> {
+  const apiKeys = validateApiKeys();
+
+  // Try HF Inference API first (if available)
+  if (apiKeys.hf) {
+    let retries = API_CONFIG.maxRetries;
+
+    while (retries > 0) {
+      try {
+        console.log(`Attempting content-aware fill with HF Inference API (attempt ${API_CONFIG.maxRetries - retries + 1}/${API_CONFIG.maxRetries})...`);
+        return await contentAwareFillWithInferenceAPI(params);
+      } catch (error) {
+        retries--;
+        console.warn(`HF Inference API attempt failed:`, error);
+
+        if (error instanceof Error && error.message.includes('loading') && retries > 0) {
+          console.log('Model is loading, retrying after delay...');
+          await delay(API_CONFIG.retryDelay * 2);
+          continue;
+        }
+
+        if (retries === 0) {
+          console.warn('HF Inference API failed after all retries, falling back to Replicate');
+          break;
+        }
+
+        await delay(API_CONFIG.retryDelay);
+      }
+    }
+  }
+
+  // Fallback to Replicate
+  if (!apiKeys.replicate) {
+    throw new Error('HF Inference API is unavailable. Please configure VITE_REPLICATE_API_KEY in your .env file as a fallback. Get your API key from https://replicate.com/account/api-tokens');
+  }
+
+  try {
+    console.log('Starting content-aware fill with Replicate...');
+
+    // Convert blobs to data URLs (Replicate accepts data URLs)
+    const imageDataUrl = await blobToBase64(params.image);
+    const maskDataUrl = await blobToBase64(params.mask);
+
+    console.log('Creating Replicate prediction via proxy...');
+
+    // Step 1: Create prediction (via proxy to avoid CORS)
+    const createResponse = await fetch(REPLICATE_PROXY_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        version: '95b7223104132402a9ae91cc677285bc5eb997834bd2349fa486f53910fd68b3',
+        input: {
+          image: imageDataUrl,
+          mask: maskDataUrl,
+          prompt: params.prompt || 'photorealistic, seamless, natural, high quality',
+          num_inference_steps: 50,
+          guidance_scale: 7.5
+        }
+      })
+    });
+
+    if (!createResponse.ok) {
+      const errorText = await createResponse.text();
+      console.error('Replicate API error:', errorText);
+
+      if (createResponse.status === 401) {
+        throw new Error('Invalid Replicate API key. Please check your VITE_REPLICATE_API_KEY in .env file.');
+      }
+      if (createResponse.status === 402) {
+        throw new Error('Replicate API billing issue. Please check your account at https://replicate.com/account');
+      }
+
+      throw new Error(`Replicate API error: ${errorText}`);
+    }
+
+    const prediction = await createResponse.json();
+    console.log('Prediction created:', prediction.id);
+
+    // Step 2: Poll for completion
+    let result = prediction;
+    const maxAttempts = 60; // 60 attempts * 2 seconds = 2 minutes max
+    let attempts = 0;
+
+    while (result.status !== 'succeeded' && result.status !== 'failed' && attempts < maxAttempts) {
+      await delay(2000); // Wait 2 seconds between polls
+      attempts++;
+
+      console.log(`Polling attempt ${attempts}/${maxAttempts}, status: ${result.status}`);
+
+      const pollResponse = await fetch(`${REPLICATE_PROXY_URL}/${prediction.id}`, {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (!pollResponse.ok) {
+        throw new Error('Failed to poll prediction status');
+      }
+
+      result = await pollResponse.json();
+    }
+
+    if (result.status === 'failed') {
+      console.error('Prediction failed:', result.error);
+      throw new Error(`Inpainting failed: ${result.error || 'Unknown error'}`);
+    }
+
+    if (result.status !== 'succeeded') {
+      throw new Error('Inpainting timed out. Please try again.');
+    }
+
+    if (!result.output || !result.output[0]) {
+      throw new Error('No output image received from Replicate');
+    }
+
+    console.log('Inpainting successful!');
+
+    // Step 3: Fetch the result image and convert to blob URL
+    const imageUrl = result.output[0];
+    const imageResponse = await fetch(imageUrl);
+    const imageBlob = await imageResponse.blob();
+
+    return URL.createObjectURL(imageBlob);
+
+  } catch (error) {
+    console.error('Content-aware fill error:', error);
+    throw error instanceof Error ? error : new Error('Failed to fill transparent areas');
+  }
+}
+
+// Helper function to convert Blob to base64
+async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Background removal function
+export async function removeBackground(imageBlob: Blob): Promise<string> {
+  const apiKeys = validateApiKeys();
+  
+  if (!apiKeys.photoroom) {
+    throw new Error('PhotoRoom API key is not configured or invalid');
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('image_file', imageBlob);
+
+    const response = await fetch(PHOTOROOM_API_URL, {
+      method: 'POST',
+      headers: {
+        'x-api-key': PHOTOROOM_API_KEY
+      },
+      body: formData
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('PhotoRoom API error:', errorText);
+      
+      if (response.status === 401) {
+        throw new Error('Invalid PhotoRoom API key. Please check your API key configuration.');
+      }
+      if (response.status === 429) {
+        throw new Error('PhotoRoom API rate limit exceeded. Please wait before trying again.');
+      }
+      if (response.status === 413) {
+        throw new Error('Image file too large. Please use a smaller image.');
+      }
+      
+      throw new Error(`PhotoRoom API error: ${response.status} - ${errorText}`);
+    }
+
+    const outputBlob = await response.blob();
+    return URL.createObjectURL(outputBlob);
+  } catch (error) {
+    console.error('Background removal error:', error);
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Failed to remove background. Please try again.');
+  }
+}
+
+// Theme generation function
+export async function generateThemeWithChatGPT(themeName: string): Promise<GameStory> {
+  const apiKeys = validateApiKeys();
+  
+  if (!apiKeys.openai) {
+    throw new Error('OpenAI API key is not configured or invalid');
+  }
+
+  const prompt = `Create a detailed slot game theme based on "${themeName}". Include rich, visual descriptions for all symbols, focusing on artistic elements and visual details that would work well in a slot game. Format the response as a JSON object with the following structure:
+  {
+    "title": "Theme name",
+    "description": "Brief theme description",
+    "theme": "Overall theme description",
+    "symbols": {
+      "standard": [
+        {
+          "name": "Symbol name",
+          "description": "Detailed visual description focusing on artistic elements",
+          "visualDetails": "Specific visual elements, textures, and materials",
+          "artStyle": "Detailed art style description",
+          "symbolMechanics": "How the symbol behaves visually",
+          "specialEffects": "Visual effects and animations"
+        }
+      ],
+      "special": {
+        "wild": {
+          "description": "Wild symbol description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "scatter": {
+          "description": "Scatter symbol description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "bonus": {
+          "description": "Bonus symbol description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "multiplier": {
+          "description": "Multiplier symbol description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "stickyWilds": {
+          "description": "Sticky wilds description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "expandingWilds": {
+          "description": "Expanding wilds description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        },
+        "wheelOfFortune": {
+          "description": "Wheel of fortune description",
+          "visualDetails": "Detailed visual elements",
+          "mechanics": "Symbol mechanics",
+          "effects": "Special effects"
+        }
+      }
+    }
+  }
+
+  Important guidelines:
+  1. Focus on rich, detailed visual descriptions
+  2. Include specific artistic elements and materials
+  3. Describe textures, lighting, and effects in detail
+  4. Make each symbol unique and visually distinct
+  5. Ensure all standard symbols (minimum 5) are fully described
+  6. Include detailed visual effects and animations
+  7. Consider how symbols would look in a slot game interface`;
+
+  try {
+    const response = await fetch(OPENAI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a creative director specializing in slot game design with expertise in visual art direction. Provide extremely detailed, creative descriptions focusing on visual elements, artistic style, and aesthetic details.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.8,
+        max_tokens: 2000
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error('OpenAI API error:', error);
+      
+      if (response.status === 401) {
+        throw new Error('Invalid OpenAI API key. Please check your API key configuration.');
+      }
+      if (response.status === 429) {
+        throw new Error('OpenAI API rate limit exceeded. Please wait before trying again.');
+      }
+      if (response.status === 402) {
+        throw new Error('OpenAI API quota exceeded. Please check your billing details.');
+      }
+      
+      throw new Error(`OpenAI API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      throw new Error('Invalid response from OpenAI API');
+    }
+    
+    const themeData = JSON.parse(data.choices[0].message.content);
+    return themeData;
+  } catch (error) {
+    console.error('Theme generation error:', error);
+    if (error instanceof Error) {
+      throw error;
+    }
+    throw new Error('Failed to generate theme. Please try again.');
+  }
+}
+
+// Enhanced image generation function with professional art style support
+export async function generateImage(options: {
+  prompt: string;
+  negative_prompt?: string;
+  width?: number;
+  height?: number;
+  num_inference_steps?: number;
+  guidance_scale?: number;
+  model?: keyof typeof MODEL_ENDPOINTS;
+  image?: string;
+  mask_image?: string;
+  strength?: number;
+  artStyle?: string; // New parameter for art style
+}): Promise<string> {
+  if (!options.prompt) {
+    throw new Error('Prompt is required');
+  }
+
+  const apiKeys = validateApiKeys();
+  
+  if (!apiKeys.hf) {
+    throw new Error('Hugging Face API key is not configured or invalid. Please ensure it starts with "hf_" and has inference permissions.');
+  }
+
+  console.log('Starting image generation...');
+  console.log('Art Style:', options.artStyle || 'default');
+
+  // Apply art style enhancements if specified
+  let enhancedPrompt = options.prompt;
+  let enhancedNegativePrompt = options.negative_prompt || '';
+  let styleSpecs = {
+    guidance_scale: options.guidance_scale || 7.5,
+    num_inference_steps: options.num_inference_steps || 30
+  };
+
+  if (options.artStyle && ART_STYLES[options.artStyle]) {
+    // Detect if prompt contains ornamental keywords
+    const ornamentalKeywords = ['frame', 'ornament', 'filigree', 'gem', 'jewel', 'decorative', 'border', 'carved', 'inlay', 'beveled', 'ornate'];
+    const hasOrnaments = ornamentalKeywords.some(keyword => 
+      options.prompt.toLowerCase().includes(keyword)
+    );
+    
+    // Detect if prompt contains dragon keywords for Custom SlotArt
+    const dragonKeywords = ['dragon', 'drom'];
+    const hasDragon = dragonKeywords.some(keyword => 
+      options.prompt.toLowerCase().includes(keyword)
+    ) && options.artStyle === 'custom_slotart';
+    
+    if (hasDragon) {
+      // Use dragon-specific style for Custom SlotArt
+      const style = ART_STYLES[options.artStyle];
+      const dragonStyle = style.dragonStyle;
+      
+      if (dragonStyle) {
+        // Detect angle keywords in the prompt
+        const angleKeywords = Object.keys(dragonStyle.angles);
+        let selectedAngle = 'front-view'; // default
+        
+        for (const angle of angleKeywords) {
+          if (options.prompt.toLowerCase().includes(angle.replace('-', ' ')) || 
+              options.prompt.toLowerCase().includes(angle)) {
+            selectedAngle = angle;
+            break;
+          }
+        }
+        
+        // If no specific angle found, randomly select one for variety
+        if (selectedAngle === 'front-view' && !options.prompt.toLowerCase().includes('front')) {
+          const angles = Object.keys(dragonStyle.angles);
+          selectedAngle = angles[Math.floor(Math.random() * angles.length)];
+        }
+        
+        const angleDescription = dragonStyle.angles[selectedAngle];
+        enhancedPrompt = `${dragonStyle.basePrompt}, ${angleDescription}, ${options.prompt}`;
+        enhancedNegativePrompt = `${enhancedNegativePrompt}, ${dragonStyle.negativePrompt}`;
+        
+        // Use style-specific technical specifications
+        styleSpecs = {
+          guidance_scale: styleEnhancements.technicalSpecs.guidance_scale,
+          num_inference_steps: styleEnhancements.technicalSpecs.num_inference_steps
+        };
+      }
+    } else {
+      // Use regular style enhancements
+      const styleEnhancements = enhancePromptWithStyle(options.prompt, options.artStyle, hasOrnaments);
+      enhancedPrompt = styleEnhancements.enhancedPrompt;
+      enhancedNegativePrompt = `${enhancedNegativePrompt}, ${styleEnhancements.negativePrompt}`;
+      
+      // Use style-specific technical specifications
+      styleSpecs = {
+        guidance_scale: styleEnhancements.technicalSpecs.guidance_scale,
+        num_inference_steps: styleEnhancements.technicalSpecs.num_inference_steps
+      };
+    }
+  }
+
+  // Add base quality enhancements
+  enhancedPrompt = `${enhancedPrompt}`;
+  enhancedNegativePrompt = `${enhancedNegativePrompt}`;
+
+  let retries = API_CONFIG.maxRetries;
+  let lastError: Error | null = null;
+  let useDedicatedEndpoint = false;
+
+  while (retries > 0) {
+    try {
+      await waitForRateLimit();
+      addRequest();
+
+      // Prepare request body for dedicated endpoint with style-enhanced parameters
+      const requestBody = {
+        inputs: enhancedPrompt,
+        parameters: {
+          negative_prompt: enhancedNegativePrompt,
+          num_inference_steps: styleSpecs.num_inference_steps,
+          guidance_scale: styleSpecs.guidance_scale,
+          width: options.width || 1024,
+          height: options.height || 1024,
+          ...(options.image && { 
+            image: options.image,
+            strength: options.strength || 0.8 
+          })
+        }
+      };
+
+      const endpoint = `${HF_API_URL}/${MODEL_ENDPOINTS[options.model || 'stable-diffusion-xl']}`;
+      console.log('Making request to regular Hugging Face API with enhanced style...');
+      console.log('Endpoint:', endpoint);
+      console.log('Enhanced prompt preview:', enhancedPrompt.substring(0, 200) + '...');
+      console.log('Style specifications:', styleSpecs);
+
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), API_CONFIG.timeout);
+
+      try {
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${HF_API_KEY}`,
+            'Content-Type': 'application/json',
+            'Accept': 'image/png'
+          },
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        });
+
+        clearTimeout(timeoutId);
+
+        console.log(`Response status: ${response.status}`);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('Hugging Face API Error Response:', errorText);
+          
+          let errorMessage = 'Failed to generate image';
+          
+          // Try to parse error response
+          try {
+            const errorData = JSON.parse(errorText);
+            if (errorData.error) {
+              errorMessage = errorData.error;
+            } else if (errorData.message) {
+              errorMessage = errorData.message;
+            }
+          } catch (parseError) {
+            // Use status-based error messages
+            switch (response.status) {
+              case 400:
+                errorMessage = 'Bad request - please check your prompt and parameters';
+                break;
+              case 401:
+                errorMessage = 'Unauthorized - please check your API key';
+                break;
+              case 403:
+                errorMessage = 'Forbidden - insufficient permissions';
+                break;
+              case 404:
+                errorMessage = 'Endpoint not found - please verify the endpoint URL';
+                break;
+              case 429:
+                errorMessage = 'Rate limit exceeded - please wait before trying again';
+                break;
+              case 500:
+                errorMessage = 'Internal server error - please try again later';
+                break;
+              case 503:
+                errorMessage = 'Service unavailable - please try again later';
+                break;
+              default:
+                errorMessage = `HTTP ${response.status}: ${errorText || 'Unknown error'}`;
+            }
+          }
+
+          throw new Error(errorMessage);
+        }
+
+        // Check content type
+        const contentType = response.headers.get('content-type');
+        console.log('Content-Type:', contentType);
+
+        if (!contentType || !contentType.startsWith('image/')) {
+          // Try to read as text to see what we got
+          const responseText = await response.text();
+          console.error('Unexpected response type:', responseText);
+          throw new Error('Expected image response but received: ' + (contentType || 'unknown content type'));
+        }
+
+        console.log('Successfully received image response, creating blob...');
+        const blob = await response.blob();
+        
+        // Validate blob
+        if (blob.size === 0) {
+          throw new Error('Received empty image response');
+        }
+
+        console.log('Blob size:', blob.size, 'bytes');
+        
+        const imageUrl = URL.createObjectURL(blob);
+        
+        console.log('Image generation successful using regular Hugging Face API with enhanced art style!');
+        return imageUrl;
+
+      } catch (fetchError) {
+        clearTimeout(timeoutId);
+        
+        if (fetchError instanceof Error && fetchError.name === 'AbortError') {
+          throw new Error('Request timed out - please try again');
+        }
+        
+        throw fetchError;
+      }
+
+    } catch (error) {
+      console.error(`Generation attempt ${API_CONFIG.maxRetries - retries + 1} failed:`, error);
+      lastError = error instanceof Error ? error : new Error('An unexpected error occurred');
+      
+      // Handle specific retry conditions
+      if (error instanceof Error) {
+        if (error.message.includes('timed out') && retries > 1) {
+          console.log(`Request timed out, waiting ${API_CONFIG.retryDelay}ms before retry...`);
+          await delay(API_CONFIG.retryDelay);
+          retries--;
+          continue;
+        } else if (error.message.includes('Rate limit') && retries > 1) {
+          console.log(`Rate limited, waiting ${API_CONFIG.retryDelay * 2}ms before retry...`);
+          await delay(API_CONFIG.retryDelay * 2);
+          retries--;
+          continue;
+        } else if (error.message.includes('Service unavailable') && retries > 1) {
+          console.log(`Service unavailable, waiting ${API_CONFIG.retryDelay}ms before retry...`);
+          await delay(API_CONFIG.retryDelay);
+          retries--;
+          continue;
+        }
+      }
+      
+      if (retries <= 1) {
+        throw lastError;
+      }
+      
+      retries--;
+      await delay(API_CONFIG.retryDelay);
+    }
+  }
+
+  throw lastError || new Error('Failed to generate image after multiple retries');
+}
+
+// Smart extraction prompt parsing with OpenAI
+export async function parseExtractionPrompt(
+  userPrompt: string,
+  availableLabels: string[]
+): Promise<{ labels: string[]; confidence: 'high' | 'medium' | 'low' | 'fallback' }> {
+  const apiKeys = validateApiKeys();
+
+  // If OpenAI is not available, return fallback signal
+  if (!apiKeys.openai) {
+    console.log('OpenAI API not available, using fallback matching');
+    return { labels: [], confidence: 'fallback' };
+  }
+
+  try {
+    const systemPrompt = `You are an AI assistant that helps extract facial features from images.
+Available feature labels are: ${availableLabels.join(', ')}
+
+Common mappings:
+- "eyes" → l_eye, r_eye
+- "eyebrows" or "brows" → l_brow, r_brow
+- "ears" → l_ear, r_ear
+- "lips" or "mouth" → mouth, u_lip, l_lip
+- "face" → skin, nose, l_eye, r_eye, l_brow, r_brow, l_ear, r_ear, mouth, u_lip, l_lip
+- "head" → everything including hair
+
+Your task is to parse the user's natural language request and return ONLY the feature labels they want to extract.
+Return your response as a JSON object with this structure:
+{
+  "labels": ["label1", "label2", ...],
+  "confidence": "high" | "medium" | "low"
+}
+
+Examples:
+Input: "extract the eyes"
+Output: {"labels": ["l_eye", "r_eye"], "confidence": "high"}
+
+Input: "remove everything except hair"
+Output: {"labels": ["skin", "nose", "l_eye", "r_eye", "l_brow", "r_brow", "l_ear", "r_ear", "mouth", "u_lip", "l_lip", "neck", "cloth"], "confidence": "medium"}
+
+Input: "get the nose and both ears"
+Output: {"labels": ["nose", "l_ear", "r_ear"], "confidence": "high"}
+
+Be intelligent about understanding variations, synonyms, and context.`;
+
+    const response = await fetch(OPENAI_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-3.5-turbo', // Using 3.5-turbo for cost efficiency
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.3, // Lower temperature for more consistent results
+        max_tokens: 200,
+        response_format: { type: 'json_object' } // Force JSON response
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error('OpenAI API error:', error);
+
+      // Return fallback on API errors
+      if (response.status === 401) {
+        console.warn('Invalid OpenAI API key, using fallback');
+      } else if (response.status === 429) {
+        console.warn('OpenAI rate limit exceeded, using fallback');
+      }
+      return { labels: [], confidence: 'fallback' };
+    }
+
+    const data = await response.json();
+
+    if (!data.choices || !data.choices[0] || !data.choices[0].message) {
+      console.warn('Invalid OpenAI response format, using fallback');
+      return { labels: [], confidence: 'fallback' };
+    }
+
+    const result = JSON.parse(data.choices[0].message.content);
+
+    // Validate the result
+    if (!result.labels || !Array.isArray(result.labels)) {
+      console.warn('Invalid result format from OpenAI, using fallback');
+      return { labels: [], confidence: 'fallback' };
+    }
+
+    // Filter to only include valid labels
+    const validLabels = result.labels.filter((label: string) =>
+      availableLabels.includes(label)
+    );
+
+    console.log(`OpenAI parsed prompt: "${userPrompt}" → [${validLabels.join(', ')}] (confidence: ${result.confidence})`);
+
+    return {
+      labels: validLabels,
+      confidence: result.confidence || 'medium'
+    };
+
+  } catch (error) {
+    console.error('Error parsing extraction prompt with OpenAI:', error);
+    return { labels: [], confidence: 'fallback' };
+  }
+}
+
+export interface GameStory {
+  title: string;
+  description: string;
+  theme: string;
+  symbols: {
+    standard: Array<{
+      name: string;
+      description: string;
+      visualDetails: string;
+      artStyle: string;
+      symbolMechanics?: string;
+      specialEffects?: string;
+    }>;
+    special: {
+      wild: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      scatter: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      bonus: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      multiplier: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      stickyWilds: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      expandingWilds: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+      wheelOfFortune: {
+        description: string;
+        visualDetails: string;
+        mechanics?: string;
+        effects?: string;
+      };
+    };
+  };
+  features?: Array<{
+    name: string;
+    description: string;
+    visualEffects: string;
+  }>;
+  visualStyle?: {
+    mainStyle: string;
+    artDirection: string;
+    colorTheory: string;
+    lightingStyle: string;
+  };
+  colorPalette?: Array<{
+    color: string;
+    name: string;
+    usage: string;
+  }>;
+}
