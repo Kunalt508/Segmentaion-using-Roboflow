@@ -295,3 +295,5 @@ If you find this project useful, please consider giving it a star! ⭐
 **Built with** ❤️ **using React, TypeScript, and AI**
 
 **Last Updated**: October 28, 2025 | **Version**: 2.0.0
+#   S e g m e n t a t i o n - u s i n g - R o b o l f o w  
+ 
