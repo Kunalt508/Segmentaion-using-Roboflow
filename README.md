@@ -9,9 +9,9 @@ Professional image segmentation tool powered by **AI and Roboflow workflows**, s
 
 ---
 
-## ✨ Key Features
+##  Key Features
 
-### 🤖 Smart Segmentation (Roboflow Powered)
+###  Smart Segmentation (Roboflow Powered)
 
 * Unified segmentation pipeline using Roboflow workflows
 * Automatic image type detection (face vs landscape)
@@ -21,9 +21,9 @@ Professional image segmentation tool powered by **AI and Roboflow workflows**, s
 
 ---
 
-## 🧠 New Architecture (Roboflow Integration)
+##  New Architecture (Roboflow Integration)
 
-### 🔄 System Overview
+###  System Overview
 
 ```
 Frontend (React)
@@ -35,7 +35,7 @@ Roboflow Workflow (3 Models)
 Processed Masks → Frontend
 ```
 
-### ⚙️ Roboflow Workflow Details
+###  Roboflow Workflow Details
 
 * **Workspace**: `segmentationslotart`
 * **Workflow ID**: `custom-workflow-3`
@@ -47,9 +47,9 @@ Processed Masks → Frontend
 
 ---
 
-## 🚀 Quick Start
+##  Quick Start
 
-### 1️⃣ Clone Repository
+###  Clone Repository
 
 ```bash
 git clone https://github.com/your-username/Segmentation-Art.git
@@ -58,7 +58,7 @@ cd Segmentation-Art
 
 ---
 
-### 2️⃣ Setup Python Backend
+###  Setup Python Backend
 
 ```bash
 pip install -r requirements.txt
@@ -83,7 +83,7 @@ Backend runs on: **http://localhost:5000**
 
 ---
 
-### 3️⃣ Setup Frontend
+###  Setup Frontend
 
 ```bash
 cd demo-app
@@ -106,7 +106,7 @@ Frontend runs on: **http://localhost:3000**
 
 ---
 
-## 📡 API Endpoints
+##  API Endpoints
 
 ### Health Check
 
@@ -128,7 +128,7 @@ POST /api/segment
 
 ---
 
-## 🔄 How It Works
+##  How It Works
 
 1. Upload image in frontend
 2. Image sent to Flask backend (base64)
@@ -143,15 +143,15 @@ POST /api/segment
 
 ---
 
-## 🎯 Segmentation Modes
+##  Segmentation Modes
 
-### 👤 Face Mode
+###  Face Mode
 
 * Detects facial features:
 
   * eyes, nose, mouth, ears, hair, skin
 
-### 🏞️ Landscape Mode
+###  Landscape Mode
 
 * Detects objects:
 
@@ -159,7 +159,7 @@ POST /api/segment
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 ### Frontend
 
@@ -178,7 +178,7 @@ POST /api/segment
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 seg-art/
@@ -193,7 +193,7 @@ seg-art/
 
 ---
 
-## 🧪 Development Commands
+##  Development Commands
 
 ### Backend
 
@@ -211,7 +211,7 @@ npm run preview
 
 ---
 
-## 📊 Performance
+##  Performance
 
 * AI detection: ~2–5 seconds
 * Supports high-resolution images (up to 4K)
@@ -219,7 +219,7 @@ npm run preview
 
 ---
 
-## 🔒 Security
+##  Security
 
 * No image storage on server
 * API keys stored in environment variables
@@ -227,7 +227,7 @@ npm run preview
 
 ---
 
-## 🚨 Troubleshooting
+##  Troubleshooting
 
 * Ensure backend is running on port 5000
 * Verify API key is set correctly
@@ -236,7 +236,7 @@ npm run preview
 
 ---
 
-## 🤝 Contributing
+##  Contributing
 
 1. Fork repository
 2. Create feature branch
@@ -245,7 +245,7 @@ npm run preview
 
 ---
 
-## 🔮 Future Improvements
+##  Future Improvements
 
 * Video segmentation
 * Batch processing
@@ -254,18 +254,16 @@ npm run preview
 
 ---
 
-## 📄 License
+##  License
 
 MIT License
 
 ---
 
-## 🙏 Acknowledgments
+##  Acknowledgments
 
 * Roboflow (workflow + inference)
 * Open-source AI ecosystem
 * React & Vite communities
 
 ---
-
-⭐ If you find this project useful, consider starring the repository!
